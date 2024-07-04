@@ -73,7 +73,7 @@ Container Network Interface defines a standard that describe how the container o
 IRSA allows you to assign permission to applications running within a Kubernetes cluster. It integrates with the Kubernetes component Service Accounts and AWS IAM. It works by using the build in OpenID Connector that comes with EKS. You create an IAM Identity Prover using the OpenID Connect Issuer URL and then create IAM Roles with attached IAM policies which the Kubernetes Service Accounts assume to communicate with AWS Services. The first step to implementing IRSA is to create an Identity Provider in IAM and link it to the EKS cluster, to do this follow the steps below. 
 1. Create the identity provider with the following command `eksctl utils associate-iam-oidc-provider --cluster=eks-acg --approve`. You can check that this command was successful by browsing to the IAM console and checking the Identity Providers tab. 
 ### Update the Bookstore Microservices to IRSA 
-In a previous section we added Dynamo DB permissions to the whole worker node meaning that any application deployed to the worker nodes had access to all of DynamoDB. The next steps are going to implement _least privelege principles_ by creating application specific IAM policies. To implement this follow the steps below. 
+In a previous section we added Dynamo DB permissions to the whole worker node meaning that any application deployed to the worker nodes had access to all of DynamoDB. The next steps are going to implement _least privilege principles_ by creating application specific IAM policies. To implement this follow the steps below. 
 1. Remove the DynamoDB permissions from the worker nodes. Browse to the NodeInstanceRole and remove the _AmazonDynamoDBFullAccess_. We do this manually because we manually added it in a previous step. 
 2. Each microservice has it's own CloudFormation template for creating the IAM Policy that allows the microservice to access its own DynamoDB table. You can create it by running the [create-iam-policy.sh](./clients-api/infra/cloudformation/create-iam-policy.sh) in each of the microservices directory. Please note, you'll need to cd into the cloudformation directory before running the script. 
 3. Create the Kubernetes Service Account that will use the above IAM policy `eksctl create iamserviceaccount --name <MICROSERVICE_NAME>-api-iam-service-account --namespace development --cluster eks-acg --attach-policy-arn <ARN_FOR_IAM_POLICY> --approve` this command will create both the service account in the k8s cluster and the IAM role in AWS. You can check the k8s service account with `kubectl get sa --namespace development` and you can check the IAM Role by checking the latest Cloudformation template that has been created. You can also find the arn for the IAM role by running the following command: `kubectl describe sa -n development <SERVICE_ACCOUNT_NAME>` in the output notice the _annotations_ field and see the value for _eks.amazonaws.com/role-arn_. 
@@ -85,3 +85,145 @@ Great, in the last section we updated the Bookstore Microservices to follow the 
 2. First we'll update the load balancer. Run the following [create-irsa.sh](./Infrastructure/k8s-tooling/load-balancer-controller/create-irsa.sh). This script deploys a CloudFormation template that creates the IAM Policy for the service account to use. Then it creates the service account and IAM role using the `eksctl create iamserviceaccount` command. Before updating the helm chart to use the new service account. 
 3. Then we'll update External DNS. Run the following [create-irsa.sh](./Infrastructure/k8s-tooling/external-dns/create-irsa.sh). This script differs from the last one as it doesn't need to create a new IAM Policy as it uses Amazon's _AmazonRoute52FullAccess_ IAM Policy. So, it creates the service account and IAM role using the `eksctl create iamserviceaccount` command. Before updating the helm chart to use the new service account. 
 4. Finally, we'll update CNI. Run the following [create-irsa.sh](./Infrastructure/k8s-tooling/cni/setup-irsa.sh). This script differs from the last as it overrides the existing service account. If you've got a good eye you'll notice in the output of the previous commands it asked for an override flag. This script provides this flag, see line 10. Then it deletes the pods which will trigger a new pod to be created and the new changes will apply to the new pods. Notice that the script doesn't deploy a helm chart as CNI is already installed on the cluster by default. 
+## More Power for Less Money
+By default when we spin up and EKS cluster is uses On-Demand Instances which have some pros and cons. 
+| Pros                                       | Cons                                                           |
+|--------------------------------------------|----------------------------------------------------------------|
+| Full control over the virtual machine      | Not that good for starting small                               |
+| Autoscaling capabilities                   | Reserved Instances could work, but are you sure about capacity |
+| Fairly quick stand-up process              | Long-running machines = more maintenance                       |
+| Could take advantage of reserved instances | Could get expensive fast                                       |
+In this section we'll look at some ways to optmise the cost of your EKS cluster. 
+### Spot Instances
+Spot instances are short running machines, they cost around 80% less than On-Demand, and they integrate with EKS. When using spot instances you set a price point at wish you wish to pay for the instances and amazon claims back those instances if the price increases past your threshold. To implement spot instances follow the steps below. 
+1. First let's get some information about the existing nodegroup with the command `eksctl get nodegroups --cluster eks-acg`. Notice the TYPE is unmanaged. 
+2. Now deploy a new nodegroup that uses spot instances by changing dir to ./Infrastructure/eksctl/02-spot-instances and running `eksctl create nodegroup -f cluster.yaml`. Open [cluster.yaml](./Infrastructure/eksctl/02-spot-instances/cluster.yaml) and inspect the nodeGroups section. The config responsible for setting spot instances is shown below. For more info, check out the [ekstctl docs](https://eksctl.io/usage/spot-instances/)
+```yaml
+instancesDistribution:
+      instanceTypes: ["t3.medium", "t3a.medium"]
+      onDemandPercentageAboveBaseCapacity: 0
+```
+3. You can now delete the on-demand nodegroup with `eksctl delete nodegroup --cluster eks-acg eks-node-group`
+### Spot Instances and Node Termination Handler
+Great, we've reduce the cost of our worker nodes by implementing spot instances. However, as spot instances can be taken away in any given moment by AWS they are not highly available and can cause downtime in your applications. The termination handler exists on a pod inside the worker node and listens out for the AWS Termination notification. When the worker node received this termination notification from AWS the Termination Handler moves the pods to another available worker node before the worker node is shutdown. To implement Termination Handler follow the steps below. 
+1. First, ensure that you have the AWS eks-charts repo added in helm with `helm repo add eks https://aws.github.io/eks-charts`. 
+2. Create the pods with helm using `helm install aws-node-termination-handler --namespace kube-system eks/aws-node-termination-handler`
+### EKS Managed Node Groups
+EKS Managed Node groups are exactly what they sound like, fully managed worker nodes from AWS. It has no additional cost, autoscaling is handled by AWS, and supports both On-Demand and Spot Instances. Check out the [cluster.yaml](./Infrastructure/eksctl/03-managed-nodes/cluster.yaml). The config block responsible for managed worker nodes is shown below. 
+```yaml
+managedNodeGroups:
+  - name: eks-node-group-managed-nodes
+    instanceType: t3.medium
+    desiredCapacity: 3
+    privateNetworking: true
+```
+To configure managed worker nodes follow the instructions below. 
+1. Run the following command to configure managed nodes `eksctl create nodegroup -f cluster` from within [Infrastructure/eksctl/03-managed-nodes/](./Infrastructure/eksctl/03-managed-nodes/). 
+2. You can confirm that the nodegroup is managed by running `eksctl get nodegrops --cluster eks-acg` and then notice the TYPE column is managed. 
+3. Now that we have a fully managed nodegroup delete the spot instance node group with `eksctl delete nodegroup --cluster eks-acg eks-node-group-spot-instances`
+### EKS and Fargate
+Fargate is Amazon's serverless containers platform that was originally implemented for |ECS but has since been extended to EKS. Pricing is at the resource level for what the pods consume. It integrates with Kubernetes files and is a cost effective option since you never overpay you pay for what the pods require. Fargate uses a scheduler that has a profile, you specify whether to use this profile in your k8s files. If you use it the Fargate scheduler spins up the pod in a Fargate runtime environment. The Fargate scheduler works along side the normal EKS scheduler so if you don't specify the Fargate profile you can still schedule your pods into physical kubernetes nodes. To implement Fargate follow the steps below. 
+1. From the [Infrastructure/eksctl/04-fargate dir](./Infrastructure/eksctl/04-fargate/) run the following command to deploy the Fargate profile `eksctl create fargateprofile -f cluster.yaml`. Open the [cluster.yaml](./Infrastructure/eksctl/04-fargate/cluster.yaml) file and notice the `faragteProfiles` section, this configuration will deploy pods with the `development` namespace into a Fargate runtime. 
+2. Once deployed you can check it out in the EKS console by scrolling to the bottom of the page, notice the Fargate Profiles section. 
+3. After deploying the Fargate profile you'll notice that the pods in the development namespace are still on the physical worker nodes run `kubectl get pods -n development -o wide` and note the NODE is an ec2 instance. This is because the Fargate scheduler only kicks in when pods are being scheduled and not already running. If you delete the pods you'll notice that they get spun up in the Fargate runtime confirmed by fargate prefix on the NODE column entry. 
+
+> Pro tip: you can delete all of the running pods using these commands `kubectl get pods -n development | grep Running | awk '{print $1}'` and ``kubectl delete pods -n development `!!```
+
+Congrats the Bookstore pods are now running serverless! 
+### Summary Table
+| Comparison Items | Unamanaged | Managed | Fargate |
+-----------------------------------------------------
+| Pricing Model    | EC2        | EC2     | Pod     |
+| Operating System | Custom AMI | Always latest EKS-optimised AMI | N/A |
+| Access level to the customer | Customer manages access to the node | SSH access only (if configured) | No possible access to the machine |
+| Node/Pod relationship | A node can host multiple Pods | A node can host multiple Pods | A node can host only one Pod | 
+| Node control level | Creations, upgrades, and terminations in customer's hands | Creations, upgrades, and terminations, in AWS' hands | Creations and terminations in AWS' hands |    
+
+## Continuous Integration and Continuous Deployment
+CICD is the process of safely and efficiently getting code into production. Ok, there's more to it than that but this course is focused on EKS and won't dive too deep into CI/CD if you're interested check out [ACG's Implementing a Full CI/CD Pipeline](https://learn.acloud.guru/course/93e6884d-ac98-49b6-a9cd-5e357d2dbb41/overview). In this section we're going to be integrating a CI/CD pipeline into EKS so that we can package up our Bookstore code and deploy it to a k8s cluster. There are many tools that can help achieve this but the ones we're using in this course are:
+- CodeCommit: For source control management 
+- CodeBuild: For building docker images and pushing them to ECR 
+- CodePipeline: For glueing everything together into a pipeline 
+### Workflow Definition
+Each microservice has their own repo in CodeCommit, and features are added via a separate branch, when the branch is merged to the main branch then the CI/CD Pipeline is triggered. The workflow can be broken down into steps as follows. 
+1. A developer has access to main branch which contains the source code which is stored on CodeCommit
+2. The developer creates a new feature branch and makes changes to the code. 
+3. The developer merges the feature branch into the main branch. 
+4. The above step triggers CodeCommit to send out a CloudWatch event stating that changes have been merged into the main branch. 
+5. CodePipeline orchestrates the following. 
+  a. Source Stage: CodeBuild retrieves code from CodeCommit
+  b. Build Stage: CodeBuild builds the Docker image and pushes it to ECR 
+  c. Deploy Dev Stage: CodeBuild updates the app version in EKS using Helm
+  d. Manual Approval: CodePipeline awaits for manual intervention to move to the next stage, this can be whilst the QA team tests the dev environment, for example. 
+  e. Deploy Prod Stage: CodeBuild pushes the latest docker image into the production k8s cluster
+
+The versioning system we're going to use for this project is MAJOR.MINOR.GIT_COMMIT_SHA. For example, `1.0.af873c03`. For more information on versioning check out [semver.org](https://semver.org/). 
+### Source Code and Building 
+In the following steps we're going to create the CodeCommit repo for the microservices and create the CodeBuild scripts to push the container images to ECR. 
+1. Deploy [cicd-1-codecommit.yaml](./Infrastructure/cloudformation/cicd/cicd-1-codecommit.yaml) with `aws cloudformation deploy --stack-name <MICROSERVICE_NAME>-api-codecommit-repo --template-file cicd-1-codecommit.yaml --parameter-overrides AppName=<MICROSERVICE_NAME>-api`. This CloudFormation Stack simply deploys the CodeCommit repo for the specified microservice. 
+2. Browse to your IAM User (cloud_user for ACG Cloud Playground Users) and generate _HTTPS Git credentials for AWS CodeCommit_ and copy and paste the username and password somewhere safe and secure. 
+3. Next setup git by changing directory into whichever microservice you just deployed a repo for and quickly running the following commands, note that you'll only have to setup the user and email once.  
+```bash
+git config --global user.email "cloud-user@acg.com"
+git config --global user.name "cloud-user"
+git init 
+git add . 
+git status 
+git commit -m "initial upload"
+git remote add origin <CODE_COMMIT_URL_FOUND_IN_THE_AWS_CONSOLE>
+git push origin master 
+<SUPPLY_YOUR_USERNAME_AND_PASSWORD_NOTED_FROM_STEP_2>
+```
+4. After completing the last step you've uploaded the source code for the microservice to the CodeCommit repo. Next, we'll expand the existing CloudFormation template that created that repo with the following command `aws cloudformation deploy --stack-name <MICROSERVICE_NAME>-api-codecommit-repo --template-file cicd-2-ecr-and-build.yaml --parameter-overrides AppName=<MICROSERVICE_NAME>-api --capabilities CAPABILITY_IAM`. This CloudFormation template creates and ECR Repo for storing docker images, IAM permissions, and a CodeBuild Project which builds the docker image and pushes it to ECR. 
+5. Checkout the corresponding [buildspec.yaml](./clients-api/infra/codebuild/buildspec.yml) in each of the microservices `infra/codebuild` directories for details steps that the codebuild project executes. 
+6. From the CodeBuild AWS Console click into the newly created project and click on start build. Once it completes checkout the ECR repo for the newly created docker image. Repeat the above steps for each microservice.
+7. Once you have the CodeCommit Repo, ECR Repo, and CodeBuild Project for each microservice, it's time to automate the build process with CodePipeline. To do this run `aws cloudformation deploy --stack-name <MICROSERVICES_NAME>-api-codecommit-repo --template-file cicd-3-automatic-build.yaml --parameter-overrides AppName=<MICROSERVICES_NAME>-api --capabilities CAPABILITY_IAM`. This updates the CloudFormation stack to include; A CloudWatch Event Rule that triggers when changes to the source code are made and triggers a CodePipelineBuild, A Code Pipeline with the source and build stage as mentioned at the start of this section. 
+8. You can inspect the CodePipline further on the AWS console. You can also test the pipeline by making a change to the master branch which will trigger the pipeline. Repeat for the other microservices. 
+### Automatic Build and Deploy to Development Environment
+In this section we're going to automate the deployment to the development environment when a change is made to the codebase. We're going to be using CodeBuild with Helm to achieve this. 
+
+First we'll be deploying the [cicd-4-deploy-development](Infrastructure/cloudformation/cicd/cicd-4-deploy-development.yaml) Cloudformation template. This template adds a stage that deploys the app to the development namespace within the kubernetes cluster. It does this by using the [buildspec.yaml](clients-api/infra/codebuild/deployment/buildspec.yml) locates in each microservice's `codebuild/deployment` directory. 
+
+This buildspec.yaml file installs the `awscli`,`helm` and `kubectl` cli tools, updated the kubeconfig to point to the eks cluster, and then finally installs the app using helm through the [create.sh](clients-api/infra/helm-v4/create.sh) script. 
+
+Follow the steps below to complete this process. 
+1. Before the stage can run the IAM Role for the pipeline must be able to authenticate with the EKS cluster. To do this we update the clusters config map to add the `IAM Service Role` user to the group `system:masters` (This is overkill but for the demo it works). ` eksctl create iamidentitymapping --cluster eks-acg --username [MICROSERVICE_NAME]-api-deployment --group system:masters --arn [MICROSERVICES_IAM_SERVICE_ROLE_ARN]`. You can grab the Pipeline's IAM Role from CloudFormation. 
+2. Repeat this process for all of the Micro services. 
+3. Change directories into `Infrastructure/cloudformation/cicd` and run `aws cloudformation deploy --stack-name <MICROSERVICES_NAME>-api-codecommit-repo --template-file cicd-4-deploy-development.yaml --parameter-overrides AppName=<MICROSERVICES_NAME>-api --capabilities CAPABILITY_IAM` for each microservice. 
+4. You can test each pipeline by making a change to the codebase and watching the pipeline complete. 
+5. You can confirm the success by describing the new pods that gets created by the pipeline. Notice that the Image will end in the latest version of the container image. 
+
+### Automatic Build and Deploy to Production Environment
+In this section we're going to focus on setting up the the Production environment and then configuring the CICD Pipeline to deploy into this environment after a manual approval. 
+### Setting up the Production environment 
+These are the steps we're going to take for creating the production environment. 
+#### Point the Development Environment to a different URL
+We're going to be deploying a new version of the application with a new [helm chart](inventory-api/infra/helm-v5). In the [ingress.yaml](inventory-api/infra/helm-v5/templates/ingress.yaml) notice on line 19 `host: {{ eq .Release.Namespace "development" | ternary "inventory-api-development" "inventory-api" }}.{{ .Values.baseDomain }}` basically if the pod is deployed to a development namespace then it's host name is postfixed with `-development` otherwise it is not. 
+
+1. Modify the deployment [buildspec.yaml](inventory-api/infra/codebuild/deployment/buildspec.yml) file. Under the build phase change the command `cd infra/helm-v4` to `cd infra/helm-v5`. Push your changes to the master branch. 
+2. Watch the pipeline complete and check that the name of the ingress has changed with `kubectl get ingress -n development | grep [MICROSERVICE_NAME]`. Notice the `-development` postfix. 
+3. Repeat for the other Microservices 
+#### Create DynamoDB Tables
+This one is a relatively simple process as we've done it before for the development environment. We need to run the [create--dynamodb-table.sh](inventory-api/infra/cloudformation/create-dynamodb-table.sh) with the namespace of production. 
+1. Change into the dir [MICROSERVICE_NAME]-api/infra/cloudformation/ and run `./create-dynamodb-table.sh) production`
+2. Repeat for the other microservices 
+3. Now we need to add the IAM permissions to allow the production pods to access the DynamoDB tables. Simple run `./create-iam-policy.sh production` 
+4. Repeat for all of the Microservices
+
+#### Create IAM Service Accounts 
+As with the development environment the production environment needs IAM Roles and K8s Service accounts to apply the principle of least privilege to the pods. To create them follow the steps below. 
+1. Grab the IAM Policy Arn we created in the last step by browsing to the `production-iam-policy-[MICROSERVICE_NAME]-api` CloudFormation stack. 
+2. In the console run the following command to create the k8s service account `eksctl create iamserviceaccount --name [MICROSERVICE_NAME]-api-iam-service-account --namespace production --cluster eks-acg --attach-policy-arn [IAM_POLICY_ARN] --approve`
+3. You can verify this by running `eksctl get iamserviceaccounts --cluster eks-acg`. Notice that the service account name matches the one create for the development environment. This is ok because they're in different namespaces. 
+4. Repeat for each microservice. 
+
+#### Install Helm charts microservices
+Now let's install the production helm charts to deploy each microservice to the production namespace. 
+1. Grab the version of the latest ECR image by running `aws ecr list-images --repository-name [ECR_REPO_NAME]`. In the response grab the latest imageTag. 
+2. Change directory into the microservice's /infra/helm-v5 directory. Then run `./create.sh production [imageTag]`. This script simply installs the microservice to the production namespace using the latest image. 
+3. Repeat the process for the rest of the microservices.
+
+### Extending the CI/CD Pipeline 
+Now let's finish off the CI/CD pipeline. First we'll add in a manual approval step. In the real world this allows Quality Assurance teams to test the applications in the dev environment thoroughly before they're released into a production environment. Then we'll add a stage that deploys the application into the production environment. 
+1. Deploy the [cicd-5-deploy-prod.yaml](Infrastructure/cloudformation/cicd/cicd-5-deploy-prod.yaml) CloudFormation template with `aws cloudformation deploy --stack-name <MICROSERVICES_NAME>-api-codecommit-repo --template-file cicd-5-deploy-prod.yaml --parameter-overrides AppName=<MICROSERVICES_NAME>-api --capabilities CAPABILITY_IAM`. This template creates a new CodeBuild project which will deploy the application into the production namespace with the `-production` postfix. It also adds in a manual approval step. 
+2. Make a change to codebase to watch the pipeline in action! 
