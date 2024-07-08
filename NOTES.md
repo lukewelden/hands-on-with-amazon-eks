@@ -227,3 +227,61 @@ Now let's install the production helm charts to deploy each microservice to the 
 Now let's finish off the CI/CD pipeline. First we'll add in a manual approval step. In the real world this allows Quality Assurance teams to test the applications in the dev environment thoroughly before they're released into a production environment. Then we'll add a stage that deploys the application into the production environment. 
 1. Deploy the [cicd-5-deploy-prod.yaml](Infrastructure/cloudformation/cicd/cicd-5-deploy-prod.yaml) CloudFormation template with `aws cloudformation deploy --stack-name <MICROSERVICES_NAME>-api-codecommit-repo --template-file cicd-5-deploy-prod.yaml --parameter-overrides AppName=<MICROSERVICES_NAME>-api --capabilities CAPABILITY_IAM`. This template creates a new CodeBuild project which will deploy the application into the production namespace with the `-production` postfix. It also adds in a manual approval step. 
 2. Make a change to codebase to watch the pipeline in action! 
+
+## Service Mesh with App Mesh 
+What is a service mesh? 
+> A service mesh is a software layer that handles all communication between services in applications - [AWS](https://aws.amazon.com/what-is/service-mesh/)
+
+What is App Mesh?
+- Service Mesh in AWS
+- Manages how services communicate 
+- Provides deep visibility 
+- Plugs into the existing architecture 
+- Integrates with other AWS services 
+- Control plane is AWS's responsibility 
+
+In this section we're going to: 
+- Install the App Mesh Controller
+- Create the Mesh through Kubernetes
+- Create App Mesh Components for Each App
+- Enable Visibility with with X-Ray
+- Run through Retry Policies
+### Installing the App Mesh Controller
+In this section we're going to create the `appmesh-system` namespace, App Mesh CRDs and service accounts/IAM Roles and policies. To do so, follow the steps below. 
+1. Run the [configure-app-mesh.sh](./Infrastructure/service-mesh/configure-app-mesh.sh). This script deploys a CloudFormation Template that creates the IAM Policy that service account is going to use. It then creates the service account with eksctl before installing the appmesh-controller with helm. 
+2. You can check the deployment with `kubectl get pods -n appmesh-system` and `kubectl logs -n appmesh-system ${pod_name}`
+### Creating the Mesh through Kubernetes 
+In this section we're going to create the mesh from the Custom Resource Definitions(CRD). The mesh object will be created by the controller once the custom resource is added. Then we're going to modify the namespace by adding labels to enable the controller to look at our namespace and create the App Mesh components based on the CRD. 
+1. Making sure your in [Infrastructure/service-mesh](Infrastructure/service-mesh) deploy the development mesh with by running `kubectl apply -f development-mesh.yaml`.
+2. Confirm with `kubectl get Mesh` you can also browse to the AWS App Mesh console and view it from there. 
+3. Label the namespace to match it with the mesh by `kubectl label namespace development mesh=development-mesh` and `kubectl label namespace development "appmesh.k8s.aws/sidecarInjectorWebhook"=enabled`. The last label ensures that the pod is injected with a side car that facilitates internal communication between pods. 
+4. Confirm with `kubectl describe namespace development` notice the labels section now contains the above labels. 
+### Creating AppMesh Components for Each App
+In this section we're going to create the following three components for each microservice:
+- Virtual Node - Represents the application 
+- Virtual Router - Holds logic and rules for the traffic 
+- Virtual Service - Used for accessing the application
+
+The above components will be added by a newer version of the helm chart. You can check out the helm charts in each microservice's [helm-v6 directory](clients-api/infra/helm-v6). Specifically the [templates/mesh-components.yaml](clients-api/infra/helm-v6/templates/mesh-components.yaml). 
+
+1. Before we can implement new App Mesh components we need to update the microservices IAM permissions. Run [create-iam-policy-app-mesh.sh](clients-api/infra/cloudformation/create-iam-policy-app-mesh.sh) in each of the microservice directory. 
+2. Up until this point we haven't created a service account for the front end microservice. However, we need to do this now as the service will need access to the apis. Create a service account with `eksctl create iamserviceaccount --name front-end-iam-service-account --namespace development --cluster eks-acg --attach-policy-arn ${FRONT_END_IAM_POLICY_ARN} --approve`. The Arn can be found by checking the outputs of the cloudformation stack that creates it `aws cloudformation describe-stacks --stack development-iam-policy-front-end`
+3. Update the app via the latest helm chart. But first grab the latest image of the microservice with `aws ecr list-images --repository-name bookstore.${microservice_name}`. Then run `./create.sh development ${image_tag}` from the [${microservice_name}infra/helm-v6](clients-api/infra/helm-v6) directory. Do this for all of the microservices. 
+4. Then delete the pods for the new components to deploy. After the new pods have been created notice that in the READY column there are 2 containers. Describe the pod and notice the new `envoy` container. Which is the sidecar container we setup in the last step. 
+5. You can also run  `kubectl get VirtualNodes -n development` to see the newly created virtual nodes. You can also browse to the AWS AppMesg console to view the Virtual Routers, Services, and Nodes. 
+Good news! We've implemented an AppMesh and now our applications can communicate with one another internally. 
+### Enable visibility with XRAY 
+Xray is a tracing service for communications between components that integrates with other AWS services and is a serverless service. To implement Xray follow the steps below. 
+1. Update each microservice's IAM policy to allow Xray permissions by running [create-iam-policy-x-ray.sh](inventory-api/infra/cloudformation/create-iam-policy-x-ray.sh). This script simply runs a [cloudformation template](inventory-api/infra/cloudformation/iam-policy-app-x-ray.yaml) that updates the IAM Policy with the permissions needed. 
+2. Once the permissions are in place run [x-ray-setup.sh](Infrastructure/service-mesh/x-ray-setup.sh). This script updates the appmesh-controller app via a Helm chart. Notice the `--set tracing.enabled=true and --set tracing.provider=x-ray` on line 9 and 10. 
+3. Delete all of the pods and notice that when they spin back up again there are 3 containers in each pod. If you describe the pod there should be a new xray container attached to it. 
+4. You can check out Xray on the AWS Console and see how you can use it to troubleshoot communications between applications. 
+### Retry Policies
+Retry policies are configured on the Virtual routers, they force a communication to keep retrying between two services when one of the services is unavailable. This can be useful if a pod is restarting after an issue. Rather than failing the communication it is kept alive until the service is back. To configure it follow the steps below. 
+1. The retry policy is defined in each microservices helm chart. Specifically [mesh-components.yaml](inventory-api/infra/helm-v7/templates/mesh-components.yaml). See, `retryPolicy` on line 62. 
+2. From the console  run `./create.sh development ${image_tag}` from [inventory-api/infra/helm-v7](inventory-api/infra/helm-v7/). This script simply runs the latest version of the helm chart which enables the retry policy. 
+3. Do this for all microservices. 
+4. You can confirm this from the AppMesh AWS Console in the Virtual routers section. 
+
+## Conclusion
+Wow that was alot! If you've followed along with me you will have a fully functioning application running on EKS with a tonne of useful features enabled! I hope you had as much fun as I did running through this course! 
